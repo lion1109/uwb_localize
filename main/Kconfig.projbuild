@@ -1,0 +1,12 @@
+menu "UWB Project Config"
+
+config APP_DEBUG_LEVEL
+    int "Debug Level"
+    range 0 4
+    default 3
+
+config APP_BUILD_TYPE_DEBUG
+    bool "Debug Build"
+    default y
+
+endmenu

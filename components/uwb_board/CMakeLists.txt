@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "uwb_board.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        dw3000
+        build
+	esp_timer
+	nvs_flash
+)
