@@ -7,8 +7,6 @@ idf_component_register(
         REQUIRES uwb_board
 )
 
-# message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
-# message(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
-
-# target_compile_definitions(${COMPONENT_LIB} PRIVATE USE_ARDUINO=${USE_ARDUINO})
-# target_compile_definitions(${COMPONENT_LIB} PRIVATE USE_ARDUINO=1)
+if(UNIT_TEST)
+    add_compile_definitions(UNIT_TEST)
+endif()

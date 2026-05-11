@@ -1,0 +1,37 @@
+#!/bin/bash
+
+file=$1
+
+jq '[.[] | select(.file | contains("'$file'"))]'   build/compile_commands.json > .cppcheck.json
+
+
+cppcheck \
+  --project=.cppcheck.json			\
+  --platform=.cppcheck.esp32-ABI.xml		\
+  --std=c++11 					\
+  --enable=warning,performance,style		\
+  --suppress=missingIncludeSystem		\
+  --inconclusive				\
+  --suppress=invalidPrintfArgType_uint		\
+  --suppress=invalidPrintfArgType_sint		\
+  --quiet
+
+exit
+
+ main components/build components/uwb_board	\
+
+		cppcheck \
+  --project=build/compile_commands.json \
+  --platform=.cppcheck.esp32-ABI.xml \
+  --enable=warning,performance,style \
+  --suppress=missingIncludeSystem \
+  --inconclusive \
+  --quiet
+
+cppcheck --project=build/compile_commands.json \
+         --suppressions-list=.cppcheck-suppressions.txt \
+	 --enable=warning,performance,style	\
+         --suppress=missingIncludeSystem	\
+
+
+echo done

@@ -2,6 +2,8 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/portmacro.h>
+
 #include "driver/gpio.h"
 #include "esp_mac.h"
 #include "esp_crc.h"
@@ -199,8 +201,8 @@ static uwb_board_attributes_t makerfabs_dw3000_esp32 = {
   .crystal_frequency   = 38'400'000ULL,
   .pll_factor          = 13 * 128ULL,
   .timestamp_frequency = 38'400'000ULL * 13 * 128,
-  .tx_antenna_delay    = 16436,
-  .rx_antenna_delay    = 16436,
+  .tx_antenna_delay    = 15180, // 16436 
+  .rx_antenna_delay    = 16660,
   .max_spi_frequency   = 40'000'000ULL,
   .min_delay_us        = 570 // 540 // 533 // 1250, 465
 };
@@ -476,11 +478,11 @@ void uwb_board_init() {
     uint64_t freq_min = 1'800'000ULL;
     uint64_t d_freq = 20'000ULL;
     uint64_t time_min = check_spi_frequency(freq_min);
-    printf("check spi frequency: %lld [Hz], time %lld\n", freq_min, time_min);
+    printf("check spi frequency: %llu [Hz], time %llu\n", freq_min, time_min);
     while (true) {
         uint64_t freq_check = freq_min + d_freq; 
         uint64_t time_check = check_spi_frequency(freq_check);
-	printf("check spi frequency: %lld [Hz], time %lld\n", freq_check, time_check);
+	printf("check spi frequency: %llu [Hz], time %llu\n", freq_check, time_check);
 	if (time_check > time_min) break;
         freq_min = freq_check;
 	time_min = time_check;
@@ -699,7 +701,7 @@ bool uwb_board_transmit(uint8_t *frame, uint16_t frame_len, timestamp_t *tx_ts_p
         dwt_readtxtimestamp((uint8_t*)tx_ts_ptr);
         if (delay_type == UWB_DELAY_ABSOLUTE) {
             if (planned_time != *tx_ts_ptr) {
-	        LOGE(TAG, "uwb_board_transmit_delay: frame send with not/wrong planned tx_timestamp, diff: %lld",
+	        LOGE(TAG, "uwb_board_transmit_delay: frame send with not/wrong planned tx_timestamp, diff: %llu",
 	             uwb_board_timestamp_diff(planned_time, *tx_ts_ptr));
                 //fatal_error("uwb_board_transmit_delay: frame send with not/wrong planned tx_timestamp\n");
 		return false;

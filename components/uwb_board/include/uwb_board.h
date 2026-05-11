@@ -25,17 +25,29 @@ typedef uint64_t timestamp_t;
 #define TIMESTAMP_NONE  0x10000000000
 #define TIMESTAMP_MASK  0x0FFFFFFFFFFULL
 
-static inline int64_t uwb_board_timestamp_diff(timestamp_t t1, timestamp_t t0) {
-    // just use lower 40 bits
+static inline int64_t uwb_board_timestamp_diff(timestamp_t t1, timestamp_t t0)
+{
+    // Calculate signed difference of two 40-bit wrapping timestamps.
+    //
+    // Computes:
+    //   (t1 - t0) mod 2^40
+    //
+    // and interprets the result as signed two's complement value
+    // in the range:
+    //
+    //   [-2^39, 2^39 - 1]
+    //
+    // Result is correct as long as the true time difference
+    // is smaller than +/- 2^39 ticks (~8.6 s for DW3000).
+
     const uint64_t MASK40 = (1ULL << 40) - 1;
     const uint64_t SIGN40 = 1ULL << 39;
 
-    uint64_t d = (t1 - t0) & MASK40; // modulo 40 bit difference
+    uint64_t d = (t1 - t0) & MASK40;
 
-    // sign extension for 40 bit to int64_t:
-    // values >= 2^39 negativ interpreted
-    // result is correct, as long as |diff| < 2^35.
-    if (d & SIGN40) d |= ~MASK40;
+    // manual 40-bit sign extension to int64_t
+    if (d & SIGN40)
+        d |= ~MASK40;
 
     return (int64_t)d;
 }
