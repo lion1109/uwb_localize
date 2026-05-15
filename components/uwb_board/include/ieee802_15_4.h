@@ -9,28 +9,28 @@
 /* =========================================================
  * IEEE 802.15.4 Frame Types
  * ========================================================= */
-  #define MAC_FRAME_TYPE_BEACON        0x00
-  #define MAC_FRAME_TYPE_DATA          0x01
-  #define MAC_FRAME_TYPE_ACK           0x02
-  #define MAC_FRAME_TYPE_MAC_CMD       0x03
+#define MAC_FRAME_TYPE_BEACON        0x00
+#define MAC_FRAME_TYPE_DATA          0x01
+#define MAC_FRAME_TYPE_ACK           0x02
+#define MAC_FRAME_TYPE_MAC_CMD       0x03
 
 /* =========================================================
  * Addressing Modes
  * ========================================================= */
-  #define MAC_ADDR_MODE_NONE           0x00
-  #define MAC_ADDR_MODE_SHORT          0x02   // 16-bit
-  #define MAC_ADDR_MODE_LONG           0x03   // 64-bit
+#define MAC_ADDR_MODE_NONE           0x00
+#define MAC_ADDR_MODE_SHORT          0x02   // 16-bit
+#define MAC_ADDR_MODE_LONG           0x03   // 64-bit
 
 /* =========================================================
  * Frame Control Bit Masks
  * ========================================================= */
-  #define MAC_FCF_FRAME_TYPE_MASK      0x0007
-  #define MAC_FCF_SECURITY_EN          0x0008
-  #define MAC_FCF_FRAME_PENDING        0x0010
-  #define MAC_FCF_ACK_REQ              0x0020
-  #define MAC_FCF_PAN_COMP             0x0040
+#define MAC_FCF_FRAME_TYPE_MASK      0x0007
+#define MAC_FCF_SECURITY_EN          0x0008
+#define MAC_FCF_FRAME_PENDING        0x0010
+#define MAC_FCF_ACK_REQ              0x0020
+#define MAC_FCF_PAN_COMP             0x0040
 
-#define MAC_FCF_FRAME_VERSION_MASK   (0x3 << 12)
+#define MAC_FCF_FRAME_VERSION_MASK   0x3000
 
 #define MAC_FCF_DST_ADDR_MODE_SHIFT  10
 #define MAC_FCF_SRC_ADDR_MODE_SHIFT  14
@@ -68,8 +68,7 @@
 /* =========================================================
  * Recommended UWB profile (DS-TWR friendly)
  * ========================================================= */
-static inline uint16_t mac_make_fcf_data_short(void)
-{
+static inline uint16_t mac_make_fcf_data_short(void) {
   uint16_t fcf = 0;
 
   MAC_SET_FRAME_TYPE(fcf, MAC_FRAME_TYPE_DATA);
@@ -89,8 +88,7 @@ static inline uint16_t mac_make_fcf_data_short(void)
 /* =========================================================
  * Header length calculation (important!)
  * ========================================================= */
-static inline uint8_t mac_header_length(uint16_t fcf)
-{
+static inline uint8_t mac_header_length(uint16_t fcf) {
   uint8_t len = 0;
 
   /* Frame Control + Seq */
@@ -189,4 +187,3 @@ static inline const uint8_t *mac_parse_header_short(
 }
 
 #endif /* DW3000_IEEE802154_MAC_H */
-

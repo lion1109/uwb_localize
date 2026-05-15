@@ -56,15 +56,17 @@ static inline int64_t uwb_board_timestamp_diff(timestamp_t t1, timestamp_t t0)
 // Board and init
 
 typedef struct {
-  uint8_t  name[32];
-  uint8_t  timestamp_bits; 
-  uint64_t crystal_frequency;
-  uint32_t pll_factor;
-  uint64_t timestamp_frequency;
-  uint32_t tx_antenna_delay;
-  uint32_t rx_antenna_delay;
-  uint64_t max_spi_frequency;
-  uint16_t min_delay_us;
+    uint8_t  name[32];
+    uint8_t  timestamp_bits; 
+    uint64_t crystal_frequency;
+    uint32_t pll_factor;
+    uint64_t timestamp_frequency;
+
+    // values to calibrate
+    uint64_t max_spi_frequency; // calibrate by dw3000_benchmark
+    uint16_t min_delay_us;      // to low values break delayed transmitting
+    uint32_t tx_antenna_delay;  // raised (tx + rx) antenna delay,
+    uint32_t rx_antenna_delay;  // -> lowers measured distance
 } uwb_board_attributes_t;
 
 const uwb_board_attributes_t *uwb_board_get_attributes();
@@ -242,6 +244,9 @@ void uwb_board_set_pan_shortaddress(uint16_t pan, uint16_t uwb_board_addr);
 float uwb_board_get_carrier_freq_offset(); // after rx, device freq difference [Hz]
 float uwb_board_get_clock_freq_offset(); // after rx, system clock freq difference [ppm] 
 
+
+// debugging - improving
+uint32_t uwb_board_benchmark();
 
 
 #ifdef __cplusplus

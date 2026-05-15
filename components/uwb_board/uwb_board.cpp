@@ -20,6 +20,9 @@
 
 #include "uwb_board.h"
 
+/* [1] DW3xxx_Driver_API_Guide_6.0.14.pdf 
+ * [2] 
+ * */
 
 static const char * const TAG = "uwb_board";
 
@@ -195,18 +198,33 @@ static void test_nvs2() {
 /* This module abstracts an uwb transceiver board
  */
 
+// raising the tx + rx antenna delay sum, lowers the distance measured
+#define ad_mid 16380 // makerfabs value: 16436
+#define ad_dif   300 // default? 500
+/* ad_dif	real distance	calculated distance
+ * 1500		1.38		1.68
+ * 1500		1.00		1.41
+ * 1000         1.38            1.53
+ * 1000         1.00            1.41
+ * 1250         1.38            1.63
+ * 1250         1.00            1.38
+ *  500		1.38		1.
+ *  500		1.00		1.33
+ *    0		1.00		1.30
+ */
 static uwb_board_attributes_t makerfabs_dw3000_esp32 = {
   .name                = "makerfabs_dw3000_esp32",
   .timestamp_bits      = 40,
   .crystal_frequency   = 38'400'000ULL,
   .pll_factor          = 13 * 128ULL,
   .timestamp_frequency = 38'400'000ULL * 13 * 128,
-  .tx_antenna_delay    = 15180, // 16436 
-  .rx_antenna_delay    = 16660,
-  .max_spi_frequency   = 40'000'000ULL,
-  .min_delay_us        = 570 // 540 // 533 // 1250, 465
-};
 
+  // all following values have to be calibrated:
+  .max_spi_frequency   = 8'000'000ULL,
+  .min_delay_us        = 540, // 540 // 533 // 1250, 465
+  .tx_antenna_delay    = ad_mid - ad_dif, // 16436 
+  .rx_antenna_delay    = ad_mid + ad_dif
+};
 
 void saveValue()
 {
@@ -223,11 +241,17 @@ void saveValue()
 
 const uwb_board_attributes_t *uwb_board_get_attributes() {
     uwb_board_attributes_t *attrs = &makerfabs_dw3000_esp32;
-    // optimizations for faster boards
+    // optimizations for faster boards and calibration
+#define ad_delta_tx -0
+#define ad_delta_rx +0 // the higher, the 
     if (0x3480 == uwb_board_get_id()) {
         // attrs->max_spi_frequency = 40'000'000ULL;
+        attrs->tx_antenna_delay += ad_delta_tx;
+        attrs->rx_antenna_delay -= ad_delta_rx;
     } else if (0xdeb3 == uwb_board_get_id()) {
         // attrs->min_delay_us = 540; // 465;
+        attrs->tx_antenna_delay -= ad_delta_tx;
+        attrs->rx_antenna_delay += ad_delta_rx;
     }
     return attrs;
 }
@@ -251,6 +275,8 @@ void uwb_board_attributes_out(const uwb_board_attributes_t *attrs) {
 /* implementation for makerfabs dw3000 esp32 board using FreeRTOS port of dw3000 arduino software */
 
 #define DWT_INT_RXFCG_BIT_MASK SYS_STATUS_RXFCG_BIT_MASK
+#define DWT_INT_TXFRS_BIT_MASK SYS_STATUS_TXFRS_BIT_MASK
+
 // spi interface gpio pins: reset, irq, chip_select
 #define PIN_RST (gpio_num_t)27
 #define PIN_IRQ (gpio_num_t)34
@@ -363,12 +389,13 @@ static void switch_to_irq()
 
     //vTaskDelay(pdMS_TO_TICKS(200));
     LOGD(TAG, "DW3000 dwt_setinterrupt\n");
-    dwt_setinterrupt(DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR, 0, DWT_ENABLE_INT); // aktivate IRQ
+    //dwt_setinterrupt(DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR, 0, DWT_ENABLE_INT); // aktivate IRQ
     dwt_setinterrupt(
         DWT_INT_RXFCG_BIT_MASK |
         DWT_INT_RXFCE_BIT_MASK |
         DWT_INT_RXRFTO_BIT_MASK |
-        DWT_INT_RXPTO_BIT_MASK,
+        DWT_INT_RXPTO_BIT_MASK |
+        DWT_INT_TXFRS_BIT_MASK,
         0,
         DWT_ENABLE_INT_ONLY
     );
@@ -489,7 +516,20 @@ void uwb_board_init() {
     }
     spiFastFrequency(freq_min);
 #endif
+
+#define DWT_TIMEOUT_MAX 0xFFFFF // nearly 1 second [1]
+    dwt_setrxaftertxdelay(0); // wait 0 µs after transmit before going to rx mode
+    dwt_setrxtimeout(DWT_TIMEOUT_MAX);
 }
+
+
+uint32_t uwb_board_benchmark() {
+    
+    uint32_t t_benchmark = dw3000_benchmark();
+
+    return t_benchmark;
+}
+
 
 void uwb_board_wakeup() {
     uwb_board_transmit(nullptr,0,nullptr); // transmit empty frame to wake up
@@ -591,13 +631,11 @@ float uwb_board_get_carrier_freq_offset() { // after rx, device freq difference 
 
 /* sync stuff */
 
-uint32_t uwb_board_get_ticks_per_ns()
-{
+uint32_t uwb_board_get_ticks_per_ns() {
     return board_attrs->timestamp_frequency / 1000000000ULL;
 }
 
-timestamp_t uwb_board_get_tx_min_delay() // min number of ticks delay before uwb_board_transmit_delayed()
-{
+timestamp_t uwb_board_get_tx_min_delay() { // min number of ticks delay before uwb_board_transmit_delayed()
     return 1'000ULL * (uint64_t)board_attrs->min_delay_us * (uint64_t)uwb_board_get_ticks_per_ns();
 }
 
@@ -607,15 +645,245 @@ timestamp_t uwb_board_plan_delayed(timestamp_t tx_ts) { // uwb_board_transmit_de
 }
 
 
+// spin ###############################################################
+
+// data for receiving
+static uwb_board_receive_cb_t active_rx_cb;
+static uint8_t active_rx_flags;
+
+void uwb_board_spin_abort() {
+    uint32_t evt = EVT_ABORT;
+    xQueueSend(irq_queue, &evt, 0);
+}
+
+
+enum spin_result_t {
+    SPIN_TIMEOUT,
+    SPIN_ABORTED,
+    SPIN_RX,
+    SPIN_TX,
+    SPIN_IDLE
+};
+
+#ifndef NDEBUG
+uint64_t spin_rx_esp_ts = 0;
+uint64_t uwb_board_get_last_spin_rx_esp_ts() { return spin_rx_esp_ts; }
+#endif
+static spin_result_t spin_once(TickType_t timeout)
+{
+    LOGD(TAG, "spin_once timeout: %ld", timeout);
+    
+    board_event_t evt;
+    if (!xQueueReceive(irq_queue, &evt, timeout)) {
+        LOGD(TAG, "Timeout");
+        return SPIN_TIMEOUT;
+    }
+    LOGD(TAG, "spin_once event: %d", evt);
+
+    if (evt == EVT_ABORT) return SPIN_ABORTED;
+
+#ifndef NDEBUG
+    spin_rx_esp_ts = esp_timer_get_time();    
+#endif
+
+    uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
+
+    if (status & SYS_STATUS_TXFRS_BIT_MASK) { // TRANSMIT success
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+        return SPIN_TX;
+
+    } else if (status & SYS_STATUS_RXFCG_BIT_MASK) { // RECEIVE success
+        LOGD(TAG, "Status RXFCG");
+        uint16_t len = dwt_read16bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_BIT_MASK;
+
+        if (len > sizeof(board_rx_buffer)) {
+            LOGE(TAG, "Frame received length %d bytes larger than frame buffer", len);
+            fatal_error("Frame received length larger than frame buffer");
+	} else {
+            dwt_readrxdata(board_rx_buffer, len, 0);
+            LOGD(TAG, "Frame received: %d bytes", len);
+        }
+
+        timestamp_t rx_ts;
+        if (active_rx_flags & TRX_CB_TIMESTAMP) {
+           dwt_readrxtimestamp((uint8_t*)&rx_ts);
+           rx_ts &= TIMESTAMP_MASK;
+        } else {
+           rx_ts = TIMESTAMP_NONE;
+        }
+
+	//dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+        dwt_write32bitreg(SYS_STATUS_ID, 0xFFFFFFFF);
+	
+	// restart as early as possible !!!
+	if (active_rx_flags & TRX_AUTO_RESTART) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+	if (active_rx_cb)
+	    active_rx_cb(board_rx_buffer, len, rx_ts);
+
+        return SPIN_RX;
+    }
+   
+    // unknown state my be after uwb_board_spin_abort() ???
+    if (status == (SYS_STATUS_RXFCE_BIT_MASK | SYS_STATUS_RXFR_BIT_MASK |
+		   SYS_STATUS_RXPHD_BIT_MASK | SYS_STATUS_CIADONE_BIT_MASK | SYS_STATUS_RXSFDD_BIT_MASK | SYS_STATUS_RXPRD_BIT_MASK |
+		   SYS_STATUS_IRQS_BIT_MASK)) {
+        return SPIN_RX; // continue spinning
+    } 
+
+    // ERROR
+    if (status & SYS_STATUS_ALL_RX_ERR) {
+        LOGE(TAG, "Status ERROR (not RXFCG?) 0x%lx", status);
+        if (SYS_STATUS_RXFCE_BIT_MASK & status) {
+    	    LOGW(TAG, "STATUS RXFCE frame checksum error"); status &= ~SYS_STATUS_RXFCE_BIT_MASK; }
+        if (SYS_STATUS_RXFR_BIT_MASK & status) {
+    	    LOGW(TAG, "STATUS RXFR  frame"); status &= ~SYS_STATUS_RXFR_BIT_MASK; }
+        if (SYS_STATUS_RXPHD_BIT_MASK & status) {
+       	    LOGW(TAG, "STATUS RXPHD frame"); status &= ~SYS_STATUS_RXPHD_BIT_MASK; }
+        if (SYS_STATUS_CIADONE_BIT_MASK & status) {
+    	    LOGW(TAG, "STATUS CIADONE frame"); status &= ~SYS_STATUS_CIADONE_BIT_MASK; }
+        if (SYS_STATUS_RXSFDD_BIT_MASK & status) {
+    	    LOGW(TAG, "STATUS RXSFDD frame"); status &= ~SYS_STATUS_RXSFDD_BIT_MASK; }
+        if (SYS_STATUS_RXPRD_BIT_MASK & status) {
+    	    LOGW(TAG, "STATUS RXPRD frame"); status &= ~SYS_STATUS_RXPRD_BIT_MASK; }
+        if (SYS_STATUS_IRQS_BIT_MASK & status) {
+    	    LOGW(TAG, "STATUS IRQS frame"); status &= ~SYS_STATUS_IRQS_BIT_MASK; }
+        LOGW(TAG, "other status bits 0x%lx", status);
+	dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR); // clear error
+        
+	if (active_rx_cb)
+	    active_rx_cb(nullptr, 0, TIMESTAMP_NONE);
+
+	if (active_rx_flags & TRX_AUTO_RESTART) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+	return SPIN_RX;
+    }
+
+    if (status & SYS_STATUS_RXFTO_BIT_MASK) {
+	LOGW(TAG, "spin_once: unhandled RXFTO irq (status: %lx)", status);
+    }
+	
+    LOGE(TAG, "spin_once: unhandled SPIN_IDLE state! (status: %lx)", status);
+    //fatal_error("spin_once: unhandled SPIN_IDLE state!");
+    return SPIN_IDLE; // may be an ERROR, TODO check
+}
+
+
+void uwb_board_spin_once(TickType_t timeout) {
+    // xSemaphoreTake(lock, portMAX_DELAY);
+    LOGD(TAG, "uwb_board_spin_once call spin_once(%ld)", timeout);
+    if (SPIN_ABORTED == spin_once(timeout)) return;
+}
+
+
+void uwb_board_spin(TickType_t timeout) {
+    TickType_t end_time = (timeout==portMAX_DELAY) ? portMAX_DELAY : xTaskGetTickCount() + timeout;
+    while (true) {
+        TickType_t t_delay;
+	if (timeout==portMAX_DELAY)
+	{
+	    t_delay = portMAX_DELAY;
+	} else {
+	    TickType_t now = xTaskGetTickCount();
+	    if (now >= end_time) return;
+	    t_delay = end_time - now;
+	}
+	LOGD(TAG, "uwb_board_spin call spin_once(%ld)", t_delay);
+	uint8_t res = spin_once(t_delay);
+	LOGD(TAG, "uwb_board_spin spin_once returned %d", res);
+
+#if 0
+	// faster ABORT
+ 	uint32_t evt = 0;
+	if (xQueuePeek(irq_queue, &evt, 0) == pdTRUE) {
+            //printf("Next event is %d\n", evt);
+	    if (evt == EVT_ABORT) {
+		xQueueReceive(irq_queue, &evt, 0);
+	        LOGD(TAG, "spin_once aborted, so break loop (fast)");
+		break;
+	    }
+        }
+#endif
+	
+	if (SPIN_ABORTED == res || SPIN_TIMEOUT == res)
+	{
+	    if (SPIN_TIMEOUT == res) LOGD(TAG, "spin_once timeout, so break loop");
+	    if (SPIN_ABORTED == res) LOGD(TAG, "spin_once aborted, so break loop");
+	    break;
+	}
+	//vTaskDelay(1);
+    }
+}
+
+
+// RECEIVE ############################################################
+
+void uwb_board_receive_async(uwb_board_receive_cb_t rx_cb, cb_flags_t flags) {
+    active_rx_cb = rx_cb;
+    active_rx_flags = flags;
+
+    switch_to_irq();
+    LOGD(TAG, "dwt_rxenable status_reg: %ld", dwt_read32bitreg(SYS_STATUS_ID));
+
+    /*
+    if (flags & TRX_AUTO_RESTART)
+    	dwt_setautorxreenable(1);
+    else
+	dwt_setautorxreenable(0);
+    */
+
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+
+static struct { // data for synchronous receive
+    const uint8_t *frame;
+    uint16_t frame_len;
+    timestamp_t rx_ts;
+} cb_result;
+
+static void board_receive_cb(const uint8_t *frame, uint16_t frame_len, timestamp_t rx_ts) {
+    cb_result = { frame, frame_len, rx_ts};
+}
+
+const uint8_t *uwb_board_receive(uint16_t *frame_len_ptr, timestamp_t *rx_ts_ptr) {
+    LOGD(TAG, "uwb_board_receive\n");
+
+    cb_result = {0};
+
+    active_rx_flags = rx_ts_ptr ? TRX_CB_TIMESTAMP : 0;
+    active_rx_cb = board_receive_cb;
+    
+    switch_to_irq();
+    LOGD(TAG, "dwt_rxenable status_reg: %ld", dwt_read32bitreg(SYS_STATUS_ID));
+    //dwt_setautorxreenable(0);
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    uwb_board_spin_once(portMAX_DELAY);
+    if (cb_result.frame) {
+        if (frame_len_ptr) *frame_len_ptr = cb_result.frame_len;
+        if (rx_ts_ptr)     *rx_ts_ptr     = cb_result.rx_ts;
+    }
+    return cb_result.frame;
+}
+
+
+// TRANSMIT ###########################################################
+
 static uint8_t transmit_prepared = false;
-void uwb_board_prepare_transmit(){
-    switch_to_polling();
+void uwb_board_prepare_transmit() {
+    switch_to_irq();
     transmit_prepared = true;
 }
 
-#define pdUS_TO_TICKS(us) ((TickType_t)(((uint64_t)(us) * configTICK_RATE_HZ) / 1000000ULL))
-bool uwb_board_transmit(uint8_t *frame, uint16_t frame_len, timestamp_t *tx_ts_ptr, uint8_t delay_type,
-		        uwb_board_receive_cb_t rx_cb, cb_flags_t rx_cb_flags) {
+
+bool uwb_board_transmit(
+    uint8_t *frame,
+    uint16_t frame_len,
+    timestamp_t *tx_ts_ptr,
+    uint8_t delay_type,
+    uwb_board_receive_cb_t rx_cb,
+    cb_flags_t rx_cb_flags )
+{
     if (!transmit_prepared)
         uwb_board_prepare_transmit();
     transmit_prepared = false;
@@ -660,265 +928,56 @@ bool uwb_board_transmit(uint8_t *frame, uint16_t frame_len, timestamp_t *tx_ts_p
             return false;
     }
 
+    if (rx_cb) {
+	active_rx_cb = rx_cb;
+        active_rx_flags = rx_cb_flags;
+	start_cmd |= DWT_RESPONSE_EXPECTED;
+	//dwt_setrxaftertxdelay(0); // wait 0 µs after transmit before going to rx mode
+        //dwt_setrxtimeout(DWT_TIMEOUT_MAX);
+    }
+
     //dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK|SYS_STATUS_HPDWARN_BIT_MASK);
     if (dwt_starttx(start_cmd) == DWT_ERROR) {
-      LOGE(TAG, "TRANSMIT FAILED: dwt_starttx(0x%x) == DWT_ERROR", start_cmd);
-      uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
-      if (status & SYS_STATUS_HPDWARN_BIT_MASK) {
-        LOGW(TAG, "after failed dwt_starttx -> SYS_STATUS: HPDWARN set");
-      } else {
-        LOGW(TAG, "after failed dwt_starttx -> SYS_STATUS: 0x%lx", status);
-      }
-      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
-      return false;
-    }
-
-    uint8_t count = 10;
-    while (true) { 
-      uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
-      if (!status) {
-        vTaskDelay(pdUS_TO_TICKS(50)); // wait until frame send
-        continue;
-      }
-      if (status & SYS_STATUS_TXFRS_BIT_MASK) {
-        //LOGI(TAG, "TRANSMISSION SUCCESSFULLY DONE");
-        break;
-      } else if (status & SYS_STATUS_HPDWARN_BIT_MASK) {
-        LOGW(TAG, "uwb_board_transmit when polling for result: SYS_STATUS: HPDWARN set");
-      } else if (status & SYS_STATUS_TXFRB_BIT_MASK) {
-        //LOGW(TAG, "uwb_board_transmit when polling for result: SYS_STATUS: TXFRB set");
-      } else {
-        LOGW(TAG, "uwb_board_transmit when polling for result: SYS_STATUS: 0x%lx", status);
-      }
-      if (! count--) fatal_error("uwb_board_transmit delayed could not send frame\n");
-      vTaskDelay(pdUS_TO_TICKS(50)); // wait until frame send
-    }
-
-    // clear TX frame sent event
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
-  
-    if (tx_ts_ptr) {
-        dwt_readtxtimestamp((uint8_t*)tx_ts_ptr);
-        if (delay_type == UWB_DELAY_ABSOLUTE) {
-            if (planned_time != *tx_ts_ptr) {
-	        LOGE(TAG, "uwb_board_transmit_delay: frame send with not/wrong planned tx_timestamp, diff: %llu",
-	             uwb_board_timestamp_diff(planned_time, *tx_ts_ptr));
-                //fatal_error("uwb_board_transmit_delay: frame send with not/wrong planned tx_timestamp\n");
-		return false;
-             }
+        LOGE(TAG, "TRANSMIT FAILED: dwt_starttx(0x%x) == DWT_ERROR", start_cmd);
+        uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
+        if (status & SYS_STATUS_HPDWARN_BIT_MASK) {
+            LOGW(TAG, "after failed dwt_starttx -> SYS_STATUS: HPDWARN set");
+        } else {
+            LOGW(TAG, "after failed dwt_starttx -> SYS_STATUS: 0x%lx", status);
         }
-        *tx_ts_ptr &= TIMESTAMP_MASK;
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
+        return false;
     }
 
-    // start receive after transmit, TODO: optimize this!!!
-    // optimizations: setup before transmitting and use dw3000 capabilities to start receive after transmit
-    if (rx_cb) {
-    	uwb_board_receive_async(rx_cb, rx_cb_flags);
+    spin_result_t res;
+    do {
+        res = spin_once(pdMS_TO_TICKS(100));
+    } while (res == SPIN_IDLE);
+
+    if (res == SPIN_TX) {
+        if (tx_ts_ptr) {
+            dwt_readtxtimestamp((uint8_t*)tx_ts_ptr);
+            *tx_ts_ptr &= TIMESTAMP_MASK;
+            if (delay_type == UWB_DELAY_ABSOLUTE) {
+                if (planned_time != *tx_ts_ptr) {
+	            LOGE(TAG, "uwb_board_transmit: wrong tx timestamp, diff: %llu",
+	                uwb_board_timestamp_diff(planned_time, *tx_ts_ptr));
+		    return false;
+		}
+            }
+        }
+    } else {
+        LOGE(TAG, "TX timeout/error");
+        return false;
     }
+
     return true;
 }
 
 
-/* async stuff */
+// IEEE 802.15.4 MAC ##################################################
 
-static uwb_board_receive_cb_t active_rx_cb;
-static uint8_t active_rx_flags;
-void uwb_board_receive_async(uwb_board_receive_cb_t rx_cb, cb_flags_t flags) {
-    active_rx_cb = rx_cb;
-    active_rx_flags = flags;
-
-    switch_to_irq();
-    LOGD(TAG, "dwt_rxenable status_reg: %ld", dwt_read32bitreg(SYS_STATUS_ID));
-    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-}
-
-void uwb_board_spin_abort() {
-    uint32_t evt = EVT_ABORT;
-    xQueueSend(irq_queue, &evt, 0);
-}
-
-
-enum spin_result_t {
-    SPIN_TIMEOUT,
-    SPIN_ABORTED,
-    SPIN_RX,
-    SPIN_IDLE
-};
-
-#ifndef NDEBUG
-uint64_t spin_rx_esp_ts = 0;
-uint64_t uwb_board_get_last_spin_rx_esp_ts() { return spin_rx_esp_ts; }
-#endif
-static spin_result_t spin_once(TickType_t timeout)
-{
-    LOGD(TAG, "spin_once timeout: %ld", timeout);
-    
-    board_event_t evt;
-    if (!xQueueReceive(irq_queue, &evt, timeout)) {
-        LOGD(TAG, "Timeout");
-        return SPIN_TIMEOUT;
-    }
-    LOGD(TAG, "spin_once event: %d", evt);
-
-    if (evt == EVT_ABORT) return SPIN_ABORTED;
-
-#ifndef NDEBUG
-    spin_rx_esp_ts = esp_timer_get_time();    
-#endif
-
-    uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
-
-    // RX
-    if (status & SYS_STATUS_RXFCG_BIT_MASK)
-    {
-        LOGD(TAG, "Status RXFCG");
-        uint16_t len = dwt_read16bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_BIT_MASK;
-
-        if (len > sizeof(board_rx_buffer))
-	{
-            LOGE(TAG, "Frame received length %d bytes larger than frame buffer", len);
-            fatal_error("Frame received length larger than frame buffer");
-	} else {
-            dwt_readrxdata(board_rx_buffer, len, 0);
-            LOGD(TAG, "Frame received: %d bytes", len);
-        }
-
-        //dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-        dwt_write32bitreg(SYS_STATUS_ID, 0xFFFFFFFF);
-
-        timestamp_t rx_ts;
-        if (active_rx_flags & TRX_CB_TIMESTAMP)
-        {
-           dwt_readrxtimestamp((uint8_t*)&rx_ts);
-           rx_ts &= TIMESTAMP_MASK;
-        } else {
-           rx_ts = TIMESTAMP_NONE;
-        }
-
-	if (active_rx_cb)
-	    active_rx_cb(board_rx_buffer, len, rx_ts);
-
-	if (active_rx_flags & TRX_AUTO_RESTART) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-        return SPIN_RX;
-    }
-   
-    // unknown state my be after uwb_board_spin_abort() ???
-    if (status == (SYS_STATUS_RXFCE_BIT_MASK | SYS_STATUS_RXFR_BIT_MASK |
-		   SYS_STATUS_RXPHD_BIT_MASK | SYS_STATUS_CIADONE_BIT_MASK | SYS_STATUS_RXSFDD_BIT_MASK | SYS_STATUS_RXPRD_BIT_MASK |
-		   SYS_STATUS_IRQS_BIT_MASK)) {
-        return SPIN_RX; // continue spinning
-    } 
-
-    // ERROR
-    if (status & SYS_STATUS_ALL_RX_ERR) {
-        LOGE(TAG, "Status ERROR (not RXFCG?) 0x%lx", status);
-        if (SYS_STATUS_RXFCE_BIT_MASK & status) {
-    	    LOGW(TAG, "STATUS RXFCE frame checksum error"); status &= ~SYS_STATUS_RXFCE_BIT_MASK; }
-        if (SYS_STATUS_RXFR_BIT_MASK & status) {
-    	    LOGW(TAG, "STATUS RXFR  frame"); status &= ~SYS_STATUS_RXFR_BIT_MASK; }
-        if (SYS_STATUS_RXPHD_BIT_MASK & status) {
-       	    LOGW(TAG, "STATUS RXPHD frame"); status &= ~SYS_STATUS_RXPHD_BIT_MASK; }
-        if (SYS_STATUS_CIADONE_BIT_MASK & status) {
-    	    LOGW(TAG, "STATUS CIADONE frame"); status &= ~SYS_STATUS_CIADONE_BIT_MASK; }
-        if (SYS_STATUS_RXSFDD_BIT_MASK & status) {
-    	    LOGW(TAG, "STATUS RXSFDD frame"); status &= ~SYS_STATUS_RXSFDD_BIT_MASK; }
-        if (SYS_STATUS_RXPRD_BIT_MASK & status) {
-    	    LOGW(TAG, "STATUS RXPRD frame"); status &= ~SYS_STATUS_RXPRD_BIT_MASK; }
-        if (SYS_STATUS_IRQS_BIT_MASK & status) {
-    	    LOGW(TAG, "STATUS IRQS frame"); status &= ~SYS_STATUS_IRQS_BIT_MASK; }
-        LOGW(TAG, "other status bits 0x%lx", status);
-	dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR); // clear error
-        
-	if (active_rx_cb)
-	    active_rx_cb(nullptr, 0, TIMESTAMP_NONE);
-
-	if (active_rx_flags & TRX_AUTO_RESTART) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-	return SPIN_RX;
-    }
-	
-    fatal_error("spin_once: unhandled SPIN_IDLE state!");
-    return SPIN_IDLE; // may be an ERROR, TODO check
-}
-
-
-void uwb_board_spin_once(TickType_t timeout)
-{
-    // xSemaphoreTake(lock, portMAX_DELAY);
-    LOGD(TAG, "uwb_board_spin_once call spin_once(%ld)", timeout);
-    if (SPIN_ABORTED == spin_once(timeout)) return;
-}
-
-void uwb_board_spin(TickType_t timeout)
-{
-    TickType_t end_time = (timeout==portMAX_DELAY) ? portMAX_DELAY : xTaskGetTickCount() + timeout;
-    while (true) {
-        TickType_t t_delay;
-	if (timeout==portMAX_DELAY)
-	{
-	    t_delay = portMAX_DELAY;
-	} else {
-	    TickType_t now = xTaskGetTickCount();
-	    if (now >= end_time) return;
-	    t_delay = end_time - now;
-	}
-	LOGD(TAG, "uwb_board_spin call spin_once(%ld)", t_delay);
-	uint8_t res = spin_once(t_delay);
-	LOGD(TAG, "uwb_board_spin spin_once returned %d", res);
-
-#if 0
-	// faster ABORT
- 	uint32_t evt = 0;
-	if (xQueuePeek(irq_queue, &evt, 0) == pdTRUE) {
-            //printf("Next event is %d\n", evt);
-	    if (evt == EVT_ABORT) {
-		xQueueReceive(irq_queue, &evt, 0);
-	        LOGD(TAG, "spin_once aborted, so break loop (fast)");
-		break;
-	    }
-        }
-#endif
-	
-	if (SPIN_ABORTED == res || SPIN_TIMEOUT == res)
-	{
-	    if (SPIN_TIMEOUT == res) LOGD(TAG, "spin_once timeout, so break loop");
-	    if (SPIN_ABORTED == res) LOGD(TAG, "spin_once aborted, so break loop");
-	    break;
-	}
-	//vTaskDelay(1);
-    }
-}
-
-static struct {
-    const uint8_t *frame;
-    uint16_t frame_len;
-    timestamp_t rx_ts;
-} cb_result;
-static void board_receive_cb(const uint8_t *frame, uint16_t frame_len, timestamp_t rx_ts) {
-    cb_result = { frame, frame_len, rx_ts};
-}
-const uint8_t *uwb_board_receive(uint16_t *frame_len_ptr, timestamp_t *rx_ts_ptr) {
-    LOGD(TAG, "uwb_board_receive\n");
-
-    cb_result = {0};
-
-    active_rx_flags = rx_ts_ptr ? TRX_CB_TIMESTAMP : 0;
-    active_rx_cb = board_receive_cb;
-    
-    switch_to_irq();
-    LOGD(TAG, "dwt_rxenable status_reg: %ld", dwt_read32bitreg(SYS_STATUS_ID));
-    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-    uwb_board_spin_once(portMAX_DELAY);
-    if (cb_result.frame) {
-        if (frame_len_ptr) *frame_len_ptr = cb_result.frame_len;
-        if (rx_ts_ptr)     *rx_ts_ptr     = cb_result.rx_ts;
-    }
-    return cb_result.frame;
-}
-
-
-#include "ieee802_15_4.h";
+#include "ieee802_15_4.h"
 
 static uint8_t board_mac_seq_no = 0;
 
