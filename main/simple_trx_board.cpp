@@ -8,12 +8,17 @@
 //#include "dw3000.h"
 #include "uwb_board.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 
 #include "simple_trx_board.h"
 
 
 #define APP_NAME "SIMPLE TRX UWB BOARD v0.1"
 #define TAG "simple_rx_board"
+
+/* [1] The mathematics of two-way ranging,
+ *     https://forum.qorvo.com/uploads/short-url/toATZSWYOalHWElTUi8x4nUkw0m.pdf
+ */
 
 
 static QueueHandle_t twr_queue = NULL; // contains device_id of twr to process
@@ -45,16 +50,16 @@ STATIC anchor_data_t other_anchor = {
     .rx_esp_ts = { 0, 0 },
 #endif
 
-    .drift_per_second = 0,
-
+    .drift = 0.0,
+    .offset = 0,
+    .distance = 0.0,
+    .distance_ema = 0.0,
 #if STATISTIC
-    .drift = 0,
     .drift_ema = 0.0,
     .drift_var_ema = 0.0,
     .frequency = 0.0,
 #endif
 };
-
 
 /* Output of debug data sometimes takes to much performance. 
  * monitor(...) reacts like printf, but drops most output.
@@ -76,42 +81,6 @@ void set_monitor_limit() {
     }
 }
 #define monitor(fmt, ...) if (!monitor_max || (--monitor_cnt < 1)) { printf(fmt, ##__VA_ARGS__); monitor_cnt = monitor_max; }
-
-
-STATIC void calculate_drift(anchor_data_t *other_anchor) {
-    LOGD(TAG, "calculate_drift");
-
-    uint8_t idx_new = other_anchor->last_idx;
-    uint8_t idx_old = predessor_stamp_idx(idx_new);
-    int64_t d_tx = uwb_board_timestamp_diff(other_anchor->tx_timestamp[idx_new], other_anchor->tx_timestamp[idx_old]);
-    int64_t d_rx = uwb_board_timestamp_diff(other_anchor->rx_timestamp[idx_new], other_anchor->rx_timestamp[idx_old]);
-
-    /* d_tx is 512 bit quantized */
-
-#if STATISTIC
-    int32_t delta = (int32_t)(d_tx - d_rx);
-
-    float drift = (float)delta / (float)d_rx; 
-    other_anchor->drift = drift;
-
-    float d_mean;
-    if (other_anchor->drift_ema == 0.0)
-    {
-	other_anchor->drift_ema = drift;
-        other_anchor->drift_var_ema = 0.0;
-    } else {
-        UPDATE_EMA(other_anchor->drift_ema, drift);
-        d_mean = drift - other_anchor->drift_ema;
-        UPDATE_EMA(other_anchor->drift_var_ema, d_mean * d_mean);
-    }
-
-    float freq = timestamp_frequency / d_rx;
-    UPDATE_EMA(other_anchor->frequency, freq);
-
-    LOGD(TAG, "d_tx: %lld, d_rx: %lld, delta: %ld, drift: %e, d_mean: %e, drift_ema: %e, drift_var_ema: %e, freq: %e [Hz], freq_ema %e [Hz]",
-         d_tx, d_rx, delta, drift, d_mean, other_anchor->drift_ema, other_anchor->drift_var_ema, freq, other_anchor->frequency);
-#endif
-}
 
 
 // transmit infos defined global to access in handle_received_frame:
@@ -179,25 +148,26 @@ STATIC void handle_received_frame(const uint8_t *frame, uint16_t frame_len, time
 	    {   update_anchor_by_rx_data(&other_anchor, idx, seq_no, tx_ts, rx_ts, consecutive);
 	        if ((uint8_t)(req_seq_no + 1) == next_transmit_seq_no && req_tx_ts == last_transmit_timestamp) {
     		    // this frame is a response to my last transmitted frame
+	       	    other_anchor.last_req_seq_no = req_seq_no;
 	       	    other_anchor.req_tx_ts[idx] = req_tx_ts;
 		    other_anchor.req_rx_ts[idx] = req_rx_ts;
 	        } else {
+	       	    other_anchor.last_req_seq_no = 0;
 		    other_anchor.req_tx_ts[idx] = TIMESTAMP_NONE;
 		    other_anchor.req_rx_ts[idx] = TIMESTAMP_NONE;
 	        }
             }
     	    taskEXIT_CRITICAL(&(other_anchor.mux));
 	    
-	    if (consecutive) calculate_drift(&other_anchor);
-  	    
-	    set_monitor_limit(); 
-	    
-            float scl_offset = (uwb_board_get_clock_freq_offset() / 1000000) / 5; 
-	    monitor("RX @ %llu anchor (%d): %d, %d, tx: %llu, req_tx: %llu, req_rx: %llu, flags:%x, %.4e, %.4e, %.4e, %.4f [Hz], %.4e, %.4e, cs:%d,%d\n",
+	    //set_monitor_limit(); 
+#if 0
+            float scl_offset = (uwb_board_get_clock_freq_offset() / 1000000) / 5; // dw3000 meaning of drift is 5 times higher 
+	    monitor("RX @ %llu anchor (%d): %d, %d, tx: %llu, req_tx: %llu, req_rx: %llu, flags:%x, %.4e, %.4e, %.4e, %.2f [Hz], %.4e, %.4e, cs:%d,%d\n",
 	           rx_ts, frame_len, frame[0], seq_no, tx_ts, req_tx_ts, req_rx_ts, flags, 
 		   other_anchor.drift, other_anchor.drift_ema, sqrt(other_anchor.drift_var_ema),
 		   other_anchor.frequency, scl_offset, scl_offset-other_anchor.drift,
 		   consecutive, other_anchor.consecutive);
+#endif
 
 	    if (flags & FRAME_ANCHOR_REQ4TWR) {
 		send_response_to_last_frame = true;
@@ -215,18 +185,16 @@ STATIC void handle_received_frame(const uint8_t *frame, uint16_t frame_len, time
             
 	    update_anchor_by_rx_data(&other_anchor, idx, seq_no, tx_ts, rx_ts, consecutive);
 
-	    if (consecutive) calculate_drift(&other_anchor);
-
 	    set_monitor_limit(); 
 #if STATISTIC
             //float ccl_offset = uwb_board_get_carrier_freq_offset();
             float scl_offset = (uwb_board_get_clock_freq_offset() / 1000000) / 5; 
-	    monitor("RX @ %lld test (%d): %d, %d, %lld, cmd:%d, %.4e, %.4e, %.4e, %.4f [Hz], %.4e, %.4e, cs:%d,%d\n",
+	    printf("RX @ %lld test (%d): %d, %d, %lld, cmd:%d, %.4e, %.4e, %.4e, %.4f [Hz], %.4e, %.4e, cs:%d,%d\n",
 	           rx_ts, frame_len, frame[0], seq_no, tx_ts, cmd, 
 		   other_anchor.drift, other_anchor.drift_ema, sqrt(other_anchor.drift_var_ema),
 		   other_anchor.frequency, scl_offset, other_anchor.drift - scl_offset, consecutive, other_anchor.consecutive);
 #else
-	    monitor("RX @%lld test (%d): %d, %d, %lld, cmd:%d\n",
+	    LOGI("RX @%lld test (%d): %d, %d, %lld, cmd:%d",
 	           rx_ts, frame_len, frame[0], seq_no, tx_ts, cmd);
 #endif
 	    if (FRAME_TEST_REQ4RESPONSE == cmd) {
@@ -297,7 +265,11 @@ STATIC uint16_t fill_blink_frame(uint8_t *frame, uint8_t seq_no, const char * te
     return (p - frame) + strlen(text);
 }
     
-static void transmit_one(uint8_t frame_type = FRAME_TYPE_BLINK, anchor_data_t *other_anchor = nullptr, uwb_board_receive_cb_t = nullptr) {
+static void transmit_one(
+    uint8_t frame_type = FRAME_TYPE_BLINK,
+    anchor_data_t *anchor = nullptr,
+    uwb_board_receive_cb_t rx_cb = nullptr )
+{
     uint8_t frame[19];
     uint8_t seq_no = next_transmit_seq_no++;
 
@@ -320,11 +292,11 @@ static void transmit_one(uint8_t frame_type = FRAME_TYPE_BLINK, anchor_data_t *o
 	timestamp_t req_rx_ts; // local rx timestamp
 
 	// tx_ts planning
-	if (other_anchor) {
-	    uint8_t last_idx = other_anchor->last_idx;
-            req_seq_no = other_anchor->last_seq_no;
-            req_tx_ts = other_anchor->tx_timestamp[last_idx];
-            req_rx_ts = other_anchor->rx_timestamp[last_idx];
+	if (anchor) {
+	    uint8_t last_idx = anchor->last_idx;
+            req_seq_no = anchor->last_seq_no;
+            req_tx_ts = anchor->tx_timestamp[last_idx];
+            req_rx_ts = anchor->rx_timestamp[last_idx];
 #if 0
             // using UWB_DELAY_RX_RELATIVE fails in 10%
 	    static timestamp_t resp_delay = uwb_board_plan_delayed(min_delay << 5);
@@ -353,7 +325,9 @@ static void transmit_one(uint8_t frame_type = FRAME_TYPE_BLINK, anchor_data_t *o
 
 	int64_t esp_mid = esp_timer_get_time();
 
-	uint8_t res = uwb_board_transmit(frame, frame_len, &tx_ts, delay_type);
+        uint8_t rx_flags = rx_cb ? TRX_CB_TIMESTAMP|TRX_AUTO_RESTART : 0;
+	bool res = uwb_board_transmit(frame, frame_len, &tx_ts, delay_type,
+	 			      rx_cb, rx_flags);
 
         timestamp_t ts_end = uwb_board_get_systime();
         timestamp_t ts_diff = ts_end - now;
@@ -363,16 +337,18 @@ static void transmit_one(uint8_t frame_type = FRAME_TYPE_BLINK, anchor_data_t *o
         int64_t esp_diff_us = esp_end - esp_now;
         if ( res and tx_ts == planned) {
 	    last_transmit_timestamp = tx_ts;
-            monitor("TX anchor %s @%llu, diff: %lld, end: %lld, diff: %lld = %ld µs, req seq_no %d, tx %llu, rx %llu,  t_esp: %lld µs, t_esp prepare %lld µs, rx-now: %ld µs, rx-now-esp: %lld µs rx_spin_esp: %lld, rx_handler_esp: %lld, anchor: %lld\n",
-	        (other_anchor ? "rel" : "abs"), tx_ts, tx_ts-planned, ts_end, ts_diff, ts_diff_us,
+#if 0
+	    monitor("TX anchor %s @%llu, diff: %lld, end: %lld, diff: %lld = %ld µs, req seq_no %d, tx %llu, rx %llu,  t_esp: %lld µs, t_esp prepare %lld µs, rx-now: %ld µs, rx-now-esp: %lld µs rx_spin_esp: %lld, rx_handler_esp: %lld, anchor: %lld\n",
+	        (anchor ? "rel" : "abs"), tx_ts, tx_ts-planned, ts_end, ts_diff, ts_diff_us,
 		req_seq_no, req_tx_ts, req_rx_ts, 
 	       	esp_diff_us, esp_mid - esp_now, rx_now_us, esp_now - uwb_board_get_last_isr_esp_ts(),
 		esp_now - uwb_board_get_last_spin_rx_esp_ts(), esp_now - handler_rx_esp_ts, esp_now - anchor_esp_ts);
-        } else {
+#endif
+	} else {
 	    last_transmit_timestamp = TIMESTAMP_NONE;
 	    if (!res) tx_ts = ts_end;
             LOGE(TAG, "TX anchor %s @ %lld=%llx, planned was: %llx, diff: %lld, end: %lld, diff: %lld = %ld µs, esp_us: %lld",
-	        (other_anchor ? "rel" : "abs"), tx_ts, tx_ts, planned, tx_ts-planned, ts_end, ts_diff, ts_diff_us, esp_diff_us);
+	        (anchor ? "rel" : "abs"), tx_ts, tx_ts, planned, tx_ts-planned, ts_end, ts_diff, ts_diff_us, esp_diff_us);
         }
 
     } else if (frame_type == FRAME_TYPE_TEST) {
@@ -390,8 +366,8 @@ static void transmit_one(uint8_t frame_type = FRAME_TYPE_BLINK, anchor_data_t *o
 	timestamp_t req_rx_ts;
 
 	// tx_ts planning
-	if (other_anchor) {
-            req_rx_ts = other_anchor->rx_timestamp[other_anchor->last_idx];
+	if (anchor) {
+            req_rx_ts = anchor->rx_timestamp[anchor->last_idx];
 #if 0
             // using UWB_DELAY_RX_RELATIVE fails in 10%
 	    static timestamp_t resp_delay = uwb_board_plan_delayed(min_delay << 5);
@@ -427,14 +403,14 @@ static void transmit_one(uint8_t frame_type = FRAME_TYPE_BLINK, anchor_data_t *o
         if ( res and tx_ts == planned) {
 	    last_transmit_timestamp = tx_ts;
             monitor("TX test %s @%llx, diff: %lld, end: %lld, diff: %lld = %ld µs, t_esp: %lld µs, t_esp prepare %lld µs, rx-now: %ld µs, rx-now-esp: %lld µs rx_spin_esp: %lld, rx_handler_esp: %lld, anchor: %lld\n",
-	        (other_anchor ? "rel" : "abs"), tx_ts, tx_ts-planned, ts_end, ts_diff, ts_diff_us,
+	        (anchor ? "rel" : "abs"), tx_ts, tx_ts-planned, ts_end, ts_diff, ts_diff_us,
 	       	esp_diff_us, esp_mid - esp_now, rx_now_us, esp_now - uwb_board_get_last_isr_esp_ts(),
 		esp_now - uwb_board_get_last_spin_rx_esp_ts(), esp_now - handler_rx_esp_ts, esp_now - anchor_esp_ts);
         } else {
 	    last_transmit_timestamp = TIMESTAMP_NONE;
 	    if (!res) tx_ts = ts_end;
             LOGE(TAG, "TX test %s @ %lld=%llx, planned was: %llx, diff: %lld, end: %lld, diff: %lld = %ld µs, esp_us: %lld",
-	        (other_anchor ? "rel" : "abs"), tx_ts, tx_ts, planned, tx_ts-planned, ts_end, ts_diff, ts_diff_us, esp_diff_us);
+	        (anchor ? "rel" : "abs"), tx_ts, tx_ts, planned, tx_ts-planned, ts_end, ts_diff, ts_diff_us, esp_diff_us);
         }
     
     } else if (frame_type == FRAME_TYPE_BLINK) {
@@ -471,50 +447,89 @@ static void receive(TickType_t timeout = portMAX_DELAY) {
 }
 
 
-//#define pdUS_TO_TICKS(us) ((TickType_t)(((uint64_t)(us) * configTICK_RATE_HZ) / 1000000ULL))
 static void anchor() {
-    uint16_t long_listen = 400 + (board_id >> 8); // use board_id to get different time slots
+    while (true) {
+	static uint16_t count = 0;
+        static bool state_init = true;
+        static bool listening = false;
+        
+	uint32_t listen_time = pdMS_TO_TICKS(200);
+        if (state_init) {
+ 	    state_init = false;
+            listen_time = pdMS_TO_TICKS(5000);
+        }
 
-    uint16_t reply_delay     = 22'000; // [µs]
-    uint16_t reply_delay_max = 40'000; // [µs]
-    uint16_t reply_delay_min = 10'000; // [µs]
+	if (listening) {
+	    listening = false;
+            uwb_board_spin(listen_time);
+	} else {
+            receive(listen_time);
+	}
+	if (send_response_to_last_frame) {
+
+	    LOGD(TAG, "received a message so send a response");
+	    do { // response loop, make performant to hold downtime short
+		send_response_to_last_frame = false;
+            	vTaskDelay(pdMS_TO_TICKS(21)); // wait for remote listening
+                
+		// listen as fast as possible after responding!
+		transmit_one(FRAME_TYPE_ANCHOR, &other_anchor,
+			     &handle_received_frame);
+    		uwb_board_spin(listen_time);
+	        listening = true;
+	    } while (send_response_to_last_frame);
+
+        } else {
+	    LOGW(TAG, "nothing received, send request to any remote");
+	    state_init = true;
+	    transmit_one(FRAME_TYPE_TEST, nullptr); // , &handle_received_frame);
+        }
+	taskYIELD();
+    }
+}
+
+static void anchor_old() {
+    //uint16_t long_listen = 400 + (board_id >> 8); // use board_id to get different time slots
 
     while (true) {
 	static uint16_t count = 0;
-        static uint8_t state_init = true;
+        static bool state_init = true;
+        static bool listening = false;
 
-        int32_t listen_time = 200;
+        int32_t listen_time = 200 + (esp_random() & 0x3F); // 6 bits random
 
         if (state_init) {
- 	    listen_time = long_listen;
+ 	    listen_time = 2 * listen_time;
  	    state_init = false;
         }
 
         //monitor("anchor: receive for %ld ms\n", listen_time);
-        receive(pdMS_TO_TICKS(listen_time));
-        if (send_response_to_last_frame) {
+	if (listening) {
+	    listening = false;
+            uwb_board_spin(listen_time);
+	} else {
+            receive(pdMS_TO_TICKS(listen_time));
+	}
+	if (send_response_to_last_frame) {
 
 	    LOGD(TAG, "received a message so send a response");
 	    do { // response loop, make performant to hold downtime short
-                switch (last_received_frame_type) {
-		    case FRAME_TYPE_TEST:   reply_delay += 2000; break;
-		    case FRAME_TYPE_ANCHOR: reply_delay -=    1; break;
-		}
-		if (reply_delay < reply_delay_min) reply_delay = reply_delay_min;
-		else if (reply_delay > reply_delay_max) reply_delay = reply_delay_max;
-
 		send_response_to_last_frame = false;
-            	vTaskDelay(pdMS_TO_TICKS(reply_delay/1000)); // wait for remote device listening
-            	transmit_one(FRAME_TYPE_ANCHOR, &other_anchor);
-                receive(pdMS_TO_TICKS(listen_time)); // listen as fast as possible after responding!
+            	vTaskDelay(pdMS_TO_TICKS(19)); // wait for remote listening
+                
+		// listen as fast as possible after responding!
+		transmit_one(FRAME_TYPE_ANCHOR, &other_anchor,
+			     &handle_received_frame);
+    		uwb_board_spin(listen_time);
+	        taskYIELD();
 	    } while (send_response_to_last_frame);
 
         } else {
-	    LOGW(TAG, "nothing received send test frame to check for other anchors (reply_delay: %d,[%d,%d])",
-	        reply_delay, reply_delay_min, reply_delay_max);
-            if (reply_delay_min + 100 < reply_delay_max) reply_delay_min += 10;
-	    transmit_one(FRAME_TYPE_TEST, nullptr);
+	    LOGW(TAG, "nothing received, send to any remote");
 	    state_init = true;
+	    // listening = true;
+	    transmit_one(FRAME_TYPE_TEST, nullptr); // , &handle_received_frame);
+	    taskYIELD();
         }
         
 	if (!(count++ % 100)) {
@@ -541,9 +556,23 @@ STATIC void board_init() {
     board_id = uwb_board_get_id();
 
     // initialize boards transsceiver
-    uwb_board_set_spi_frequency(4'000'000UL); // 4.8 MHz seems to be fastest
+
+    uwb_board_set_spi_frequency(12'000'000); // 4.8 MHz seems to be fastest
     //uwb_board_set_spi_frequence(attrs->max_spi_frequency); // 4.8 MHz seems to be fastest
+/* spi-freq benchmark
+ * [MHz]    [us]
+ * 20	    error by uwb_board_init: WRONG device id
+ * 16	    error by uwb_board_init: WRONG device id
+ * 12	     849614
+ * 10	     870815
+ * 8	     947151 
+ * 6	     967034
+ * 4,8	    1019411
+ * 4	    1042147 
+ * */
     uwb_board_init();
+
+    uwb_board_benchmark();
 }
 
 
@@ -576,7 +605,8 @@ static void uwb_task(void* arg) {
 #define RTAG "ranger"
 
 #define UPDATE_EMA2(var, val, p, diff) if (abs((var)-(val)) < (diff)) (var) += (p) * (val-(var)) 
-static void calculate_range(const timestamp_t *ts, float drift, anchor_data_t *anchor) {
+inline float update_ema(float old, float val, float p, float diff) { float d = abs(old-val); return (d < diff) ? p * d : 0.0 ; } 
+static void calculate_range(const timestamp_t *ts, uint8_t consecutive, anchor_data_t *anchor, uint8_t last_seq_no, uint8_t last_req_seq_no) {
     /* T_round1 = Roundtrip-Zeit bei Gerät A
      * T_reply1 = Antwortverzögerung bei Gerät B
      * T_round2 = Roundtrip-Zeit bei Gerät B
@@ -593,39 +623,95 @@ static void calculate_range(const timestamp_t *ts, float drift, anchor_data_t *a
      timediff_t T_round2 = uwb_board_timestamp_diff(ts[5], ts[2]); // t6 - t3
      timediff_t T_reply2 = uwb_board_timestamp_diff(ts[4], ts[3]); // t5 - t4
 
-     //LOGI(RTAG, "last_idx: %d, t1, %lld, t2: %lld, t3: %lld, t4: %lld, t5: %lld, t6: %lld", anchor->last_idx, ts[0], ts[1], ts[2], ts[3], ts[4], ts[5]);
-     //LOGI(RTAG, "T_round1: %lld, T_reply1: %lld, T_round2: %lld, T_reply2: %lld, TOF1: %lld, TOF2: %lld",
-		//T_round1, T_reply1, T_round2, T_reply2, (T_round1 - T_reply1)/2, (T_round2 - T_reply2)/2);
+     timediff_t total_remote = T_round1 + T_reply2; // equal to t5 - t1
+     timediff_t total_local  = T_reply1 + T_round2; // equal to t6 - t2
+     double drift_c = (double)(total_local - total_remote) / (double)total_local; // drift compensation = -drift
+     
+     // for check and alternate tof formula
+     double T_round1_c = drift_c * T_round1 + T_round1;   
+     double T_reply2_c = drift_c * T_reply2 + T_reply2;
+     
+     // intermediate results with drift compensation
+     double T_delta1_c = T_round1_c - (double)T_reply1;
+     double T_delta2_c = (double)T_round2 - (double)T_reply2_c;
 
-     if (T_round1 < T_reply1 || T_reply1 < 1 )
-	 LOGW(RTAG, "T_round1=%lld < T_reply1=%lld || T_reply1 < 1, T_round1 - T_reply1: %lld", T_round1, T_reply1, T_round1 - T_reply1);
-     if (T_round2 < T_reply2 || T_reply2 < 1 )
-	 LOGW(RTAG, "T_round2=%lld < T_reply2=%lld || T_reply2 < 1, T_round2 - T_reply2: %lld", T_round2, T_reply2, T_round2 - T_reply2);
+     // check data consistence
+     bool ignore = false;
+     static uint8_t show_logs = 0;
+     if (T_delta1_c < 0.0 || T_delta2_c < 0.0) {
+	 ignore = true;
+	 show_logs = 3;
+     }
+     if (show_logs) {
+         show_logs--;
+	 LOGW(RTAG, "last_idx: %d, t1, %lld, t2: %lld, t3: %lld, t4: %lld, t5: %lld, t6: %lld", anchor->last_idx, ts[0], ts[1], ts[2], ts[3], ts[4], ts[5]);
+         LOGW(RTAG, "T_round1: %lld(%.1f), T_reply1: %lld, T_round2: %lld, T_reply2: %lld(%.1f), TOF1: %.1f, TOF2: %.1f",
+		    T_round1, T_round1_c, T_reply1, T_round2, T_reply2, T_reply2_c, T_delta1_c/2, T_delta2_c/2);
+         if (T_delta1_c < 0.0)
+	     LOGW(RTAG, "T_round1_c=%.1f, T_reply1=%lld, T_round1_c - T_reply1: %.1f", T_round1_c, T_reply1, T_delta1_c);
+         if (T_delta2_c < 0.0)
+	     LOGW(RTAG, "T_round2_c=%lld, T_reply2=%.1f, T_round2 - T_reply2_c: %.1f", T_round2, T_reply2_c, T_delta2_c);
+     }
 
-     int64_t tof_4 = ( T_round1 - T_reply1 ) + ( T_round2 - T_reply2 );
+     if (ignore) return;
 
      double  tof_n = (double)T_round1 * (double)T_round2 - (double)T_reply1 * (double)T_reply2;
      int64_t tof_d = T_round1 + T_round2 + T_reply1 + T_reply2;
 
-     // factors to multiply by speed of light and devide by frequency
-     static double c_f   =        RADIO_WAVE_SPEED / timestamp_frequency; // [m/s], distance the radio wave moves in one timestamp tick
-     static double c_f_4 = 0.25 * RADIO_WAVE_SPEED / timestamp_frequency; // [m/s], 
+     // distance the radio wave moves in one timestamp tick
+     static float c_f = RADIO_WAVE_SPEED / timestamp_frequency; // [m/tic]
+     static float c_f_4 = c_f / 4;
 
-     double d1 = (double)tof_4 * c_f_4;
-     double d2 = tof_n / tof_d * c_f;
+     float tof = tof_n / tof_d;
+     float d1 = tof * c_f;
+     float d2 = (T_delta1_c + T_delta2_c) * c_f_4; // alternate formula
 
      // for range ema:
-     static double ema_p = 0.04;
-     static double diff = 5.00;
+     static float ema_p = 0.08;
+     static float diff = 10.00;
+
+     timestamp_t t6_remote = (timestamp_t)(drift_c * tof + tof + 0.5) + ts[4]; // t5 + drift compensated tof
+     timediff_t offset = uwb_board_timestamp_diff(t6_remote, ts[5]); // t6_remote - t6
 
      // write results without radio/ranger mutex
-     anchor->d1 = d1;
-     anchor->d2 = d2;
+     anchor->distance = d1;
+     anchor->drift = -drift_c; // sign !
+     anchor->offset = offset;
 
-     UPDATE_EMA2(anchor->d1_ema, d1, ema_p, diff);
-     UPDATE_EMA2(anchor->d2_ema, d2, ema_p, diff);
-	
-     LOGI(RTAG, "cf: %.4f, d1: %7.4f, d2: %7.4f, ema: d1: %7.4f, d2: %7.4f, d: %7.4f", c_f, d1, d2, anchor->d1_ema, anchor->d2_ema, anchor->d2_ema / 2 - 2.0 );
+#if STATISTIC
+     static float d2_ema;
+     UPDATE_EMA2(anchor->distance_ema, d1, ema_p, diff);
+     UPDATE_EMA2(d2_ema, d2, ema_p, diff);
+
+     static float T_delta1_c_ema = 0.0;
+     static float T_delta2_c_ema = 0.0;
+     UPDATE_EMA2(T_delta1_c_ema, T_delta1_c, 0.01, 1.e9);
+     UPDATE_EMA2(T_delta2_c_ema, T_delta2_c, 0.01, 1.e9);
+
+     static float drift_ema = 0.0;
+     static float drift_var_ema = 0.0;
+     double drift_std = (anchor->drift - drift_ema);
+     UPDATE_EMA(drift_ema, anchor->drift); 
+     UPDATE_EMA(drift_var_ema, drift_std * drift_std); 
+
+     float frame_freq = (float)timestamp_frequency / total_local;
+     float r_reply21 = (T_reply2_c / T_reply1) - 1;
+     static timediff_t old_offset = 0;
+     LOGI(RTAG, "%3d %3d %3d d1:%4.3f,%6.3f, d2:%6.3f,%4.3f, "
+		"drift:%.3e,%.3e, f:%.2f[Hz], Td12:%.2f,%.2f,%9.2e, o:%6lld, r:%.4e",
+	        consecutive, last_seq_no, last_req_seq_no,
+		d1, anchor->distance_ema, d2, d2_ema, 
+                drift_ema, sqrt(drift_var_ema), frame_freq,
+		T_delta1_c_ema, T_delta2_c_ema, (T_delta1_c_ema/T_delta2_c_ema)-1,
+		offset-old_offset, r_reply21);
+     old_offset = offset;
+#else
+     LOGI(RTAG, "d1: %6.3f, d2: %6.3f, d3: %6.3f, ema: d1: %6.3f, d2: %6.3f",
+	        d1, d2, d3, anchor->d1_ema, anchor->d2_ema);
+#endif
+     if (!last_seq_no)
+         LOGI(RTAG, "timestamp_frequency: %llu, c_f: %f, RADIO_WAVE_SPEED: %f, 1/f: %e",
+		timestamp_frequency, c_f, RADIO_WAVE_SPEED, 1.0/timestamp_frequency);
 }
 
 
@@ -635,7 +721,8 @@ STATIC void ranging(uint16_t device_id) {
     // pick device
     uint8_t consecutive;
     timestamp_t ts[6];
-    float drift;
+    uint8_t last_seq_no; // for debugging
+    uint8_t last_req_seq_no; // for debugging
 
     // access global anchor_data table
     taskENTER_CRITICAL(&(other_anchor.mux));
@@ -655,7 +742,8 @@ STATIC void ranging(uint16_t device_id) {
     	    ts[4] = other_anchor.tx_timestamp[idx]; // t5
 	    ts[5] = other_anchor.rx_timestamp[idx]; // t6
 
-    	    drift = other_anchor.drift;
+    	    last_seq_no = other_anchor.last_seq_no;
+    	    last_req_seq_no = other_anchor.last_req_seq_no;
 	}
     }
     taskEXIT_CRITICAL(&(other_anchor.mux));
@@ -665,7 +753,7 @@ STATIC void ranging(uint16_t device_id) {
         return;
     }
 
-    calculate_range(ts, drift, &other_anchor);
+    calculate_range(ts, consecutive, &other_anchor, last_seq_no, last_req_seq_no);
 }
 
 static void range_task(void* arg) {
@@ -676,6 +764,7 @@ static void range_task(void* arg) {
 	xQueueReceive(twr_queue, &device_id, portMAX_DELAY);
 	// LOGI(RTAG, "got data of %x", device_id);
         ranging(device_id);
+	taskYIELD();
     }
     fatal_error("range_task end");
 }
@@ -706,7 +795,7 @@ extern "C" void app_main() {
       NULL,        // Parameter
       5,           // Priorität
       NULL,        // Task Handle
-      0            // Core 0
+      1            // Core 0
     );
 }
 #endif
